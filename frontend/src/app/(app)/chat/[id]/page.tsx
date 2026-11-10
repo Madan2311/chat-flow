@@ -1,15 +1,15 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
+import { ArrowLeft, SendHorizontal } from "lucide-react";
 import { MessageBubble } from "@/components/chat/message-bubble";
+import { Spinner } from "@/components/ui/spinner";
 import { useAuth } from "@/context/auth-context";
 import { useChats } from "@/context/chats-context";
 import { useMessages } from "@/context/messages-context";
 import { getChatTitle, getMemberNames } from "@/lib/chat-utils";
-import Link from "next/link";
-import { ArrowLeft, SendHorizontal } from "lucide-react";
-import { Spinner } from "@/components/ui/spinner";
 
 const MAX_LENGTH = 2000;
 
@@ -20,10 +20,13 @@ export default function ChatDetailPage() {
   const {
     status,
     messagesByChat,
+    hasMoreByChat,
     loadingChatId,
+    loadingOlderChatId,
     sendingChatId,
     error,
     openChat,
+    loadOlder,
     closeChat,
     sendMessage,
     clearError,
@@ -31,23 +34,41 @@ export default function ChatDetailPage() {
 
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
+  const previousHeightRef = useRef<number | null>(null);
 
   const chat = chats.find((item) => item.id === id);
-  const chatExists = Boolean(chat);
   const messages = messagesByChat[id] ?? [];
+  const hasMore = hasMoreByChat[id] ?? false;
   const isLoadingHistory = loadingChatId === id;
+  const isLoadingOlder = loadingOlderChatId === id;
   const isSending = sendingChatId === id;
+  const lastMessageId = messages[messages.length - 1]?.id;
 
   useEffect(() => {
-    if (!chatExists) return;
+    if (!chat) return;
     openChat(id);
     return () => closeChat(id);
-  }, [id, chatExists, openChat, closeChat]);
+  }, [id, chat?.id]);
 
   useEffect(() => {
     const list = listRef.current;
     if (list) list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
-  }, [messages.length]);
+  }, [lastMessageId]);
+
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list || previousHeightRef.current === null) return;
+    list.scrollTop = list.scrollHeight - previousHeightRef.current;
+    previousHeightRef.current = null;
+  }, [messages]);
+
+  const handleLoadOlder = async () => {
+    const list = listRef.current;
+    if (!list || isLoadingOlder) return;
+    previousHeightRef.current = list.scrollHeight;
+    const added = await loadOlder(id);
+    if (added === 0) previousHeightRef.current = null;
+  };
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -77,9 +98,7 @@ export default function ChatDetailPage() {
   }
 
   const showSenderFor = (index: number) =>
-    chat.isGroup &&
-    (index === 0 ||
-      messages[index - 1].sender.id !== messages[index].sender.id);
+    index === 0 || messages[index - 1].sender.id !== messages[index].sender.id;
 
   return (
     <div className="flex h-full flex-col">
@@ -87,7 +106,7 @@ export default function ChatDetailPage() {
         <div className="flex min-w-0 items-center gap-3">
           <Link
             href="/chat"
-            aria-label="Cerrar conversación"
+            aria-label="Volver a los chats"
             className="rounded-xl p-2 text-slate-300 transition-colors hover:bg-white/10"
           >
             <ArrowLeft size={20} />
@@ -129,6 +148,20 @@ export default function ChatDetailPage() {
         ref={listRef}
         className="min-h-0 flex-1 space-y-3 overflow-y-auto p-6"
       >
+        {hasMore && !isLoadingHistory && (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={handleLoadOlder}
+              disabled={isLoadingOlder}
+              className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-xs text-slate-300 transition-all hover:bg-white/10 disabled:opacity-60"
+            >
+              {isLoadingOlder && <Spinner />}
+              {isLoadingOlder ? "Cargando…" : "Cargar mensajes anteriores"}
+            </button>
+          </div>
+        )}
+
         {isLoadingHistory &&
           Array.from({ length: 3 }).map((_, index) => (
             <div
@@ -171,6 +204,7 @@ export default function ChatDetailPage() {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
+            // En escritorio Enter envía; en móvil Enter agrega un salto de línea
             const isDesktop = window.matchMedia("(min-width: 768px)").matches;
             if (isDesktop && event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();

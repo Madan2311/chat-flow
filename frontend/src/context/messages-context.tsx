@@ -6,7 +6,7 @@ import {
 import { Socket } from 'socket.io-client';
 import { useAuth } from '@/context/auth-context';
 import { useChats } from '@/context/chats-context';
-import { fetchMessages, markChatAsRead } from '@/lib/chat-service';
+import { MESSAGES_PAGE_SIZE, fetchMessages, markChatAsRead } from '@/lib/chat-service';
 import { connectSocket, disconnectSocket } from '@/lib/socket';
 import { Chat, Message, SendAck, SocketError } from '@/types';
 
@@ -20,10 +20,13 @@ interface PendingMessage {
 interface MessagesContextValue {
   status: ConnectionStatus;
   messagesByChat: Record<string, Message[]>;
+  hasMoreByChat: Record<string, boolean>;
   loadingChatId: string | null;
+  loadingOlderChatId: string | null;
   sendingChatId: string | null;
   error: string | null;
   openChat: (chatId: string) => Promise<void>;
+  loadOlder: (chatId: string) => Promise<number>;
   closeChat: (chatId: string) => void;
   sendMessage: (chatId: string, content: string) => Promise<boolean>;
   clearError: () => void;
@@ -31,9 +34,12 @@ interface MessagesContextValue {
 
 const MessagesContext = createContext<MessagesContextValue | null>(null);
 
-function mergeMessages(fetched: Message[], current: Message[]) {
-  const fetchedIds = new Set(fetched.map((message) => message.id));
-  return [...fetched, ...current.filter((message) => !fetchedIds.has(message.id))];
+function mergeMessages(...lists: Message[][]) {
+  const byId = new Map<string, Message>();
+  lists.flat().forEach((message) => byId.set(message.id, message));
+  return [...byId.values()].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+  );
 }
 
 export function MessagesProvider({ children }: { children: ReactNode }) {
@@ -42,7 +48,9 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
 
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [messagesByChat, setMessagesByChat] = useState<Record<string, Message[]>>({});
+  const [hasMoreByChat, setHasMoreByChat] = useState<Record<string, boolean>>({});
   const [loadingChatId, setLoadingChatId] = useState<string | null>(null);
+  const [loadingOlderChatId, setLoadingOlderChatId] = useState<string | null>(null);
   const [sendingChatId, setSendingChatId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingMessage | null>(null);
@@ -59,14 +67,6 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const storeHistory = useCallback((chatId: string, fetched: Message[]) => {
-    loadedChatsRef.current.add(chatId);
-    setMessagesByChat((prev) => ({
-      ...prev,
-      [chatId]: mergeMessages(fetched, prev[chatId] ?? []),
-    }));
-  }, []);
-
   useEffect(() => {
     if (!token) return;
 
@@ -79,7 +79,13 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
       const activeId = activeChatRef.current;
       if (activeId) {
         fetchMessages(token, activeId)
-          .then((fetched) => storeHistory(activeId, fetched))
+          .then((fetched) => {
+            loadedChatsRef.current.add(activeId);
+            setMessagesByChat((prev) => ({
+              ...prev,
+              [activeId]: mergeMessages(fetched, prev[activeId] ?? []),
+            }));
+          })
           .catch(() => setError('No se pudo sincronizar el historial del chat'));
       }
     };
@@ -114,7 +120,7 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
       socket.off('exception', handleException);
       socket.io.off('reconnect_attempt', handleReconnectAttempt);
     };
-  }, [token, appendMessage, storeHistory, registerIncomingMessage, addChat]);
+  }, [token, appendMessage, registerIncomingMessage, addChat]);
 
   useEffect(() => {
     if (!token) {
@@ -123,6 +129,7 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
       activeChatRef.current = null;
       loadedChatsRef.current = new Set();
       setMessagesByChat({});
+      setHasMoreByChat({});
       setPending(null);
       setStatus('disconnected');
     }
@@ -140,14 +147,44 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
 
       setLoadingChatId(chatId);
       try {
-        storeHistory(chatId, await fetchMessages(token, chatId));
+        const fetched = await fetchMessages(token, chatId);
+        loadedChatsRef.current.add(chatId);
+        setHasMoreByChat((prev) => ({ ...prev, [chatId]: fetched.length === MESSAGES_PAGE_SIZE }));
+        setMessagesByChat((prev) => ({
+          ...prev,
+          [chatId]: mergeMessages(fetched, prev[chatId] ?? []),
+        }));
       } catch (err) {
         setError(err instanceof Error ? err.message : 'No se pudieron cargar los mensajes');
       } finally {
         setLoadingChatId(null);
       }
     },
-    [token, clearUnread, storeHistory],
+    [token, clearUnread],
+  );
+
+  const loadOlder = useCallback(
+    async (chatId: string) => {
+      const oldest = messagesByChat[chatId]?.[0];
+      if (!token || !oldest || loadingOlderChatId) return 0;
+
+      setLoadingOlderChatId(chatId);
+      try {
+        const older = await fetchMessages(token, chatId, { before: oldest.createdAt });
+        setHasMoreByChat((prev) => ({ ...prev, [chatId]: older.length === MESSAGES_PAGE_SIZE }));
+        setMessagesByChat((prev) => ({
+          ...prev,
+          [chatId]: mergeMessages(older, prev[chatId] ?? []),
+        }));
+        return older.length;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'No se pudieron cargar los mensajes anteriores');
+        return 0;
+      } finally {
+        setLoadingOlderChatId(null);
+      }
+    },
+    [token, messagesByChat, loadingOlderChatId],
   );
 
   const closeChat = useCallback((chatId: string) => {
@@ -195,15 +232,21 @@ export function MessagesProvider({ children }: { children: ReactNode }) {
     () => ({
       status,
       messagesByChat,
+      hasMoreByChat,
       loadingChatId,
+      loadingOlderChatId,
       sendingChatId,
       error,
       openChat,
+      loadOlder,
       closeChat,
       sendMessage,
       clearError: () => setError(null),
     }),
-    [status, messagesByChat, loadingChatId, sendingChatId, error, openChat, closeChat, sendMessage],
+    [
+      status, messagesByChat, hasMoreByChat, loadingChatId, loadingOlderChatId,
+      sendingChatId, error, openChat, loadOlder, closeChat, sendMessage,
+    ],
   );
 
   return <MessagesContext.Provider value={value}>{children}</MessagesContext.Provider>;
